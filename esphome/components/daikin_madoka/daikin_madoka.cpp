@@ -326,7 +326,7 @@ void DaikinMadoka::query_(uint16_t cmd, std::vector<uint8_t> args) {
     return;
   }
   const auto chunks = this->split_payload_(payload);
-  const char *addr = this->parent_->address_str();
+  std::string addr = this->parent_->address_str();
   for (const auto &chk : chunks) {
     esp_err_t status = ESP_OK;
     for (int j = 0; j < BLE_SEND_MAX_RETRIES; j++) {
@@ -336,11 +336,12 @@ void DaikinMadoka::query_(uint16_t cmd, std::vector<uint8_t> args) {
       if (!status) {
         break;
       }
-      ESP_LOGD(TAG, "[%s] esp_ble_gattc_write_char failed (%d of %d), status=%d", addr, j + 1, BLE_SEND_MAX_RETRIES,
-               status);
+     ESP_LOGD(TAG, "[%s] esp_ble_gattc_write_char failed (%d of %d), status=%d",
+         addr.c_str(), j + 1, BLE_SEND_MAX_RETRIES, status);
     }
     if (status) {
-      ESP_LOGE(TAG, "[%s] Command could not be sent, last status=%d", addr, status);
+      ESP_LOGE(TAG, "[%s] Command could not be sent, last status=%d",
+         addr.c_str(), status);
       return;
     }
   }
