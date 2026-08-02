@@ -17,12 +17,7 @@ DaikinMadoka = daikin_madoka_ns.class_(
 )
 
 CONFIG_SCHEMA = (
-    climate.CLIMATE_SCHEMA
-    .extend(
-        {
-            cv.GenerateID(): cv.declare_id(DaikinMadoka),
-        }
-    )
+    climate.climate_schema(DaikinMadoka)
     .extend(ble_client.BLE_CLIENT_SCHEMA)
     .extend(cv.polling_component_schema("10s"))
 )
