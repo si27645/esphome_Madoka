@@ -15,6 +15,10 @@
 
 static const uint8_t MAX_CHUNK_SIZE = 20;
 static const uint8_t BLE_SEND_MAX_RETRIES = 5;
+// The WWR characteristic is write-without-response: the peripheral never acknowledges a write,
+// so a command can be silently lost over the air with no local error. Re-verify against the
+// following read-back and retry this many times before giving up.
+static const uint8_t SET_VERIFY_MAX_RETRIES = 3;
 
 namespace esphome::daikin_madoka {
 
@@ -43,6 +47,12 @@ struct Status {
 struct Query {
   uint16_t cmd;
   std::vector<uint8_t> args;
+  uint8_t retries_left = SET_VERIFY_MAX_RETRIES;
+};
+
+struct PendingSet {
+  std::vector<uint8_t> args;
+  uint8_t retries_left;
 };
 
 namespace espbt = esphome::esp32_ble_tracker;
@@ -59,6 +69,7 @@ class DaikinMadoka : public climate::Climate, public esphome::ble_client::BLECli
   std::queue<std::vector<uint8_t>> received_chunks_ = {};
   std::map<uint8_t, std::vector<uint8_t>> pending_chunks_ = {};
   std::queue<Query> query_queue_ = {};
+  std::map<uint16_t, PendingSet> pending_sets_ = {};
   bool pending_message_ = false;
   uint16_t notify_handle_{0};
   uint16_t wwr_handle_{0};
@@ -73,6 +84,8 @@ class DaikinMadoka : public climate::Climate, public esphome::ble_client::BLECli
   void query_(uint16_t cmd, std::vector<uint8_t> args);
   void parse_cb_(std::vector<uint8_t> msg);
   void process_incoming_chunk_(std::vector<uint8_t> chk);
+  bool check_set_argument_(uint16_t set_cmd, uint8_t argument_id, const uint8_t *value, uint8_t len);
+  void finish_set_verification_(uint16_t set_cmd, bool confirmed);
 
   void control(const climate::ClimateCall &call) override;
 

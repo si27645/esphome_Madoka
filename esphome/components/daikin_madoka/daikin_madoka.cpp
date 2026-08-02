@@ -1,6 +1,7 @@
 #include "daikin_madoka.h"
 
 #include "esphome/core/log.h"
+#include <algorithm>
 #include <utility>
 
 #ifdef USE_ESP32
@@ -44,6 +45,18 @@ inline static uint32_t get_command_cooldown(uint16_t cmd) {
   }
 }
 
+inline static bool is_set_command(uint16_t cmd) {
+  switch (cmd) {
+    case CMD_SET_SETTING_STATUS:
+    case CMD_SET_OPERATION_MODE:
+    case CMD_SET_SETPOINT:
+    case CMD_SET_FAN_SPEED:
+      return true;
+    default:
+      return false;
+  }
+}
+
 void DaikinMadoka::loop() {
   std::vector<uint8_t> chk = {};
   if (xSemaphoreTake(this->receive_semaphore_, 0L)) {
@@ -60,6 +73,9 @@ void DaikinMadoka::loop() {
     Query query = this->query_queue_.front();
     this->query_queue_.pop();
     this->query_(query.cmd, query.args);
+    if (is_set_command(query.cmd)) {
+      this->pending_sets_[query.cmd] = PendingSet{query.args, query.retries_left};
+    }
     this->pending_message_ = true;
     this->set_timeout("query", get_command_cooldown(query.cmd), [this]() { this->pending_message_ = false; });
   }
@@ -209,6 +225,7 @@ void DaikinMadoka::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
       this->should_update_ = false;
       this->query_queue_ = {};
       this->pending_message_ = false;
+      this->pending_sets_.clear();
       break;
     }
     case ESP_GATTC_WRITE_DESCR_EVT:
@@ -353,6 +370,66 @@ void DaikinMadoka::query_(uint16_t cmd, std::vector<uint8_t> args) {
   }
 }
 
+bool DaikinMadoka::check_set_argument_(uint16_t set_cmd, uint8_t argument_id, const uint8_t *value, uint8_t len) {
+  auto it = this->pending_sets_.find(set_cmd);
+  if (it == this->pending_sets_.end())
+    return true;  // nothing pending for this command, nothing to verify
+
+  const auto &args = it->second.args;
+  for (size_t i = 0; i + 1 < args.size();) {
+    uint8_t id = args[i];
+    uint8_t l = args[i + 1];
+    if (i + 2 + l > args.size())
+      break;
+    if (id == argument_id) {
+      return l == len && std::equal(value, value + len, args.begin() + i + 2);
+    }
+    i += 2 + l;
+  }
+  return true;  // this field wasn't part of the commanded set, nothing to verify
+}
+
+void DaikinMadoka::finish_set_verification_(uint16_t set_cmd, bool confirmed) {
+  auto it = this->pending_sets_.find(set_cmd);
+  if (it == this->pending_sets_.end())
+    return;
+
+  if (confirmed) {
+    this->pending_sets_.erase(it);
+    return;
+  }
+
+  PendingSet pending = it->second;
+  this->pending_sets_.erase(it);
+
+  if (pending.retries_left == 0) {
+    ESP_LOGE(TAG, "Command 0x%04X did not take effect after retries, giving up", set_cmd);
+    return;
+  }
+
+  uint16_t confirming_get = 0;
+  switch (set_cmd) {
+    case CMD_SET_SETTING_STATUS:
+      confirming_get = CMD_GET_SETTING_STATUS;
+      break;
+    case CMD_SET_OPERATION_MODE:
+      confirming_get = CMD_GET_OPERATION_MODE;
+      break;
+    case CMD_SET_SETPOINT:
+      confirming_get = CMD_GET_SETPOINT;
+      break;
+    case CMD_SET_FAN_SPEED:
+      confirming_get = CMD_GET_FAN_SPEED;
+      break;
+    default:
+      return;
+  }
+
+  ESP_LOGW(TAG, "Command 0x%04X was not confirmed, retrying (%d attempts left)", set_cmd, pending.retries_left);
+  this->query_queue_.push({set_cmd, pending.args, (uint8_t) (pending.retries_left - 1)});
+  this->query_queue_.push({confirming_get, std::vector<uint8_t>{0x00, 0x00}});
+}
+
 void DaikinMadoka::parse_cb_(std::vector<uint8_t> msg) {
   if (msg.size() < 4) {
     ESP_LOGE(TAG, "Discarding message: invalid length.");
@@ -363,28 +440,36 @@ void DaikinMadoka::parse_cb_(std::vector<uint8_t> msg) {
   const size_t message_size = msg.size();
 
   switch (function_id) {
-    case CMD_GET_SETTING_STATUS:
+    case CMD_GET_SETTING_STATUS: {
+      bool confirmed = true;
       while (i < message_size) {
         uint8_t argument_id = msg[i++];
         uint8_t len = msg[i++];
         if (argument_id == 0x20) {
           std::vector<uint8_t> val(msg.begin() + i, msg.begin() + i + len);
           this->cur_status_.status = val[0];
+          confirmed &= this->check_set_argument_(CMD_SET_SETTING_STATUS, argument_id, val.data(), len);
         }
         i += len;
       }
+      this->finish_set_verification_(CMD_SET_SETTING_STATUS, confirmed);
       break;
-    case CMD_GET_OPERATION_MODE:
+    }
+    case CMD_GET_OPERATION_MODE: {
+      bool confirmed = true;
       while (i < message_size) {
         uint8_t argument_id = msg[i++];
         uint8_t len = msg[i++];
         if (argument_id == 0x20) {
           std::vector<uint8_t> val(msg.begin() + i, msg.begin() + i + len);
           this->cur_status_.mode = val[0];
+          confirmed &= this->check_set_argument_(CMD_SET_OPERATION_MODE, argument_id, val.data(), len);
         }
         i += len;
       }
+      this->finish_set_verification_(CMD_SET_OPERATION_MODE, confirmed);
       break;
+    }
     default:
       break;
   }
@@ -414,7 +499,8 @@ void DaikinMadoka::parse_cb_(std::vector<uint8_t> msg) {
         this->mode = climate::CLIMATE_MODE_OFF;
       }
       break;
-    case CMD_GET_SETPOINT:
+    case CMD_GET_SETPOINT: {
+      bool confirmed = true;
       while (i < message_size) {
         uint8_t argument_id = msg[i++];
         uint8_t len = msg[i++];
@@ -422,19 +508,24 @@ void DaikinMadoka::parse_cb_(std::vector<uint8_t> msg) {
           case 0x20: {
             std::vector<uint8_t> val(msg.begin() + i, msg.begin() + i + len);
             this->target_temperature_high = (float) (val[0] << 8 | val[1]) / 128;
+            confirmed &= this->check_set_argument_(CMD_SET_SETPOINT, argument_id, val.data(), len);
             break;
           }
           case 0x21: {
             std::vector<uint8_t> val(msg.begin() + i, msg.begin() + i + len);
             this->target_temperature_low = (float) (val[0] << 8 | val[1]) / 128;
+            confirmed &= this->check_set_argument_(CMD_SET_SETPOINT, argument_id, val.data(), len);
             break;
           }
         }
         i += len;
       }
+      this->finish_set_verification_(CMD_SET_SETPOINT, confirmed);
       break;
+    }
     case CMD_GET_FAN_SPEED: {
       uint8_t fan_mode = 255;
+      bool confirmed = true;
       while (i < message_size) {
         uint8_t argument_id = msg[i++];
         uint8_t len = msg[i++];
@@ -443,8 +534,10 @@ void DaikinMadoka::parse_cb_(std::vector<uint8_t> msg) {
                    (argument_id == 0x20 && len == 1 && this->cur_status_.mode != 4)) {
           fan_mode = msg[i];
         }
+        confirmed &= this->check_set_argument_(CMD_SET_FAN_SPEED, argument_id, &msg[i], len);
         i += len;
       }
+      this->finish_set_verification_(CMD_SET_FAN_SPEED, confirmed);
       switch (fan_mode) {
         case 0:
           this->fan_mode = climate::CLIMATE_FAN_AUTO;
