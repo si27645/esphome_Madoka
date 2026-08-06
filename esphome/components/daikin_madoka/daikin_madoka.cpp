@@ -335,9 +335,9 @@ void DaikinMadoka::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
 }
 
 void DaikinMadoka::update() {
-  ESP_LOGD(TAG, "Got update request...");
+  ESP_LOGD(TAG, "[%s] Got update request...", this->get_name().c_str());
   if (this->node_state != espbt::ClientState::ESTABLISHED) {
-    ESP_LOGD(TAG, "...but device is disconnected");
+    ESP_LOGD(TAG, "[%s] ...but device is disconnected", this->get_name().c_str());
     return;
   }
 
@@ -352,7 +352,7 @@ static bool validate_buffer(std::vector<uint8_t> buffer) { return !buffer.empty(
 
 void DaikinMadoka::process_incoming_chunk_(std::vector<uint8_t> chk) {
   if (chk.size() < 2) {
-    ESP_LOGI(TAG, "Chunk discarded: invalid length.");
+    ESP_LOGI(TAG, "[%s] Chunk discarded: invalid length.", this->get_name().c_str());
     return;
   }
   uint8_t chunk_id = chk[0];
@@ -362,18 +362,18 @@ void DaikinMadoka::process_incoming_chunk_(std::vector<uint8_t> chk) {
     return;
   }
   if (chunk_id == 0 && !this->pending_chunks_.empty()) {
-    ESP_LOGW(TAG, "Buffer is not empty, but new message started. Clearing buffer.");
+    ESP_LOGW(TAG, "[%s] Buffer is not empty, but new message started. Clearing buffer.", this->get_name().c_str());
     this->pending_chunks_.clear();
   }
   if (this->pending_chunks_.contains(chunk_id)) {
-    ESP_LOGE(TAG, "Another packet with the same chunk ID is already in the buffer.");
-    ESP_LOGD(TAG, "Chunk ID: %d.", chunk_id);
+    ESP_LOGE(TAG, "[%s] Another packet with the same chunk ID is already in the buffer.", this->get_name().c_str());
+    ESP_LOGD(TAG, "[%s] Chunk ID: %d.", this->get_name().c_str(), chunk_id);
     return;
   }
   this->pending_chunks_[chunk_id] = chk;
 
   if (this->pending_chunks_.size() != this->pending_chunks_.rbegin()->first + 1) {
-    ESP_LOGW(TAG, "Buffer is missing packets");
+    ESP_LOGW(TAG, "[%s] Buffer is missing packets", this->get_name().c_str());
     return;
   }
 
@@ -503,7 +503,7 @@ void DaikinMadoka::finish_set_verification_(uint16_t set_cmd, bool confirmed) {
 
 void DaikinMadoka::parse_cb_(std::vector<uint8_t> msg) {
   if (msg.size() < 4) {
-    ESP_LOGE(TAG, "Discarding message: invalid length.");
+    ESP_LOGE(TAG, "[%s] Discarding message: invalid length.", this->get_name().c_str());
     return;
   }
   const uint16_t function_id = msg[2] << 8 | msg[3];
