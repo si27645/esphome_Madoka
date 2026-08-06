@@ -71,6 +71,12 @@ class DaikinMadoka : public climate::Climate, public esphome::ble_client::BLECli
   std::queue<Query> query_queue_ = {};
   std::map<uint16_t, PendingSet> pending_sets_ = {};
   bool pending_message_ = false;
+  // GET commands are also write-without-response: on a weak BLE link either the write or the
+  // NOTIFY reply carrying the answer can be silently lost. Track which GET command we're
+  // currently waiting on so it can be retried (like SET commands already are) if its cooldown
+  // elapses with no matching response. 0 means "not waiting on a GET response" (no valid
+  // command uses that value).
+  uint16_t awaiting_get_{0};
   uint16_t notify_handle_{0};
   uint16_t wwr_handle_{0};
   SemaphoreHandle_t receive_semaphore_{nullptr};

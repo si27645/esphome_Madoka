@@ -140,9 +140,28 @@ void DaikinMadoka::loop() {
     this->query_(query.cmd, query.args);
     if (is_set_command(query.cmd)) {
       this->pending_sets_[query.cmd] = PendingSet{query.args, query.retries_left};
+    } else {
+      this->awaiting_get_ = query.cmd;
     }
     this->pending_message_ = true;
-    this->set_timeout("query", get_command_cooldown(query.cmd), [this]() { this->pending_message_ = false; });
+    uint16_t cmd = query.cmd;
+    std::vector<uint8_t> args = query.args;
+    uint8_t retries_left = query.retries_left;
+    this->set_timeout("query", get_command_cooldown(cmd), [this, cmd, args, retries_left]() {
+      this->pending_message_ = false;
+      if (this->awaiting_get_ == cmd) {
+        // No response arrived before the cooldown elapsed -- on a weak BLE link either our
+        // write or the peripheral's NOTIFY reply can be silently dropped. Retry a bounded
+        // number of times, same as SET commands already do.
+        this->awaiting_get_ = 0;
+        if (retries_left > 0) {
+          this->query_queue_.push({cmd, args, (uint8_t) (retries_left - 1)});
+        } else {
+          ESP_LOGW(TAG, "[%s] No response to command 0x%04X, giving up for this cycle", this->get_name().c_str(),
+                   cmd);
+        }
+      }
+    });
   }
   if (this->should_update_) {
     this->should_update_ = false;
@@ -509,6 +528,10 @@ void DaikinMadoka::parse_cb_(std::vector<uint8_t> msg) {
   const uint16_t function_id = msg[2] << 8 | msg[3];
   size_t i = 4;
   const size_t message_size = msg.size();
+
+  if (this->awaiting_get_ == function_id) {
+    this->awaiting_get_ = 0;
+  }
 
   switch (function_id) {
     case CMD_GET_SETTING_STATUS: {
