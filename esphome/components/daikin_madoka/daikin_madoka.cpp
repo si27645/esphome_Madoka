@@ -2,6 +2,7 @@
 
 #include "esphome/core/log.h"
 #include <algorithm>
+#include <array>
 #include <utility>
 
 #ifdef USE_ESP32
@@ -9,6 +10,70 @@
 namespace esphome::daikin_madoka {
 
 using namespace esphome::climate;
+
+namespace {
+
+using BdAddr = std::array<uint8_t, ESP_BD_ADDR_LEN>;
+
+inline BdAddr to_bd_addr(const uint8_t *raw) {
+  BdAddr addr;
+  std::copy(raw, raw + ESP_BD_ADDR_LEN, addr.begin());
+  return addr;
+}
+
+// The ESP32 Bluedroid stack does not reliably run more than one SMP pairing procedure at a
+// time when acting as a central connected to several peripherals: kicking off
+// esp_ble_set_encryption() for two devices back-to-back leaves all but one stuck forever with
+// no AUTH_CMPL event and no error, so notify registration (and therefore all climate updates)
+// never happens for the losers. Serialize pairing across DaikinMadoka instances so only one
+// device is mid-handshake at a time.
+class PairingCoordinator {
+ public:
+  void request(const uint8_t *raw_addr) {
+    BdAddr addr = to_bd_addr(raw_addr);
+    if (this->pairing_) {
+      if (addr == this->current_)
+        return;  // already pairing this device
+      for (const auto &queued : this->queue_) {
+        if (queued == addr)
+          return;  // already queued
+      }
+      this->queue_.push_back(addr);
+      return;
+    }
+    this->start_(addr);
+  }
+
+  void release(const uint8_t *raw_addr) {
+    BdAddr addr = to_bd_addr(raw_addr);
+    if (!this->pairing_ || addr != this->current_)
+      return;
+    this->pairing_ = false;
+    if (!this->queue_.empty()) {
+      BdAddr next = this->queue_.front();
+      this->queue_.erase(this->queue_.begin());
+      this->start_(next);
+    }
+  }
+
+ protected:
+  void start_(const BdAddr &addr) {
+    this->current_ = addr;
+    this->pairing_ = true;
+    esp_ble_set_encryption(const_cast<uint8_t *>(addr.data()), ESP_BLE_SEC_ENCRYPT_MITM);
+  }
+
+  bool pairing_{false};
+  BdAddr current_{};
+  // Bounded by the number of ble_client/daikin_madoka instances on this device (typically a
+  // handful), only touched during the one-time pairing handshake at boot -- a std::vector here
+  // is fine, unlike a hot-path buffer.
+  std::vector<BdAddr> queue_;
+};
+
+PairingCoordinator pairing_coordinator;
+
+}  // namespace
 
 static const uint16_t CMD_GET_SETTING_STATUS = 0x0020;
 static const uint16_t CMD_SET_SETTING_STATUS = 0x4020;
@@ -188,6 +253,9 @@ void DaikinMadoka::gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_c
     case ESP_GAP_BLE_AUTH_CMPL_EVT: {
       if (!this->parent_->check_addr(param->ble_security.auth_cmpl.bd_addr))
         break;
+      // Whether pairing succeeded or failed, this device's turn is over; let the next
+      // queued device (if any) start pairing.
+      pairing_coordinator.release(param->ble_security.auth_cmpl.bd_addr);
       if (!param->ble_security.auth_cmpl.success) {
         ESP_LOGE(TAG, "Authentication failed, status: 0x%x", param->ble_security.auth_cmpl.fail_reason);
         break;
@@ -217,6 +285,9 @@ void DaikinMadoka::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
                                        esp_ble_gattc_cb_param_t *param) {
   switch (event) {
     case ESP_GATTC_DISCONNECT_EVT: {
+      // If we disconnected mid-pairing (e.g. link lost before AUTH_CMPL ever arrived), free
+      // the pairing slot so other queued devices aren't blocked forever.
+      pairing_coordinator.release(this->parent_->get_remote_bda());
       this->node_state = espbt::ClientState::IDLE;
       this->current_temperature = NAN;
       this->target_temperature = NAN;
@@ -238,7 +309,7 @@ void DaikinMadoka::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t
       }
       break;
     case ESP_GATTC_SEARCH_CMPL_EVT: {
-      esp_ble_set_encryption(this->parent_->get_remote_bda(), ESP_BLE_SEC_ENCRYPT_MITM);
+      pairing_coordinator.request(this->parent_->get_remote_bda());
       break;
     }
     case ESP_GATTC_REG_FOR_NOTIFY_EVT: {
