@@ -96,7 +96,12 @@ inline static uint32_t get_command_cooldown(uint16_t cmd) {
     case CMD_GET_SETPOINT:
     case CMD_GET_FAN_SPEED:
     case CMD_GET_SENSOR_INFORMATION:
-      return 50;
+      // With multiple simultaneous ble_client connections plus continuous scanning sharing one
+      // radio, round-trip time for a GET response routinely runs 100-300ms+, well past the old
+      // 50ms. Since a missed response now triggers a retry, too-short a cooldown here means
+      // healthy-but-slightly-slow responses get misdiagnosed as lost and retried anyway, adding
+      // more traffic to an already-congested link and making things worse, not better.
+      return 500;
     case CMD_SET_SETTING_STATUS:
       return 200;
     case CMD_SET_OPERATION_MODE:
